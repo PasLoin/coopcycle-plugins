@@ -4,7 +4,7 @@
  * Plugin Name: CoopCycle
  * Plugin URI: https://coopcycle.org/
  * Description: CoopCycle plugin for WordPress
- * Version: 0.11.0
+ * Version: 0.11.2
  * Domain Path: /i18n/languages/
  */
 
@@ -146,6 +146,13 @@ if (in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get_
                 return;
             }
 
+            // Avoid creating the delivery twice
+            // if the order changes to "processing" more than once
+            $coopcycle_delivery = $order->get_meta('coopcycle_delivery', true);
+            if (!empty($coopcycle_delivery)) {
+                return;
+            }
+
             $shipping_date = $order->get_meta('shipping_date', true);
 
             // Array
@@ -194,13 +201,21 @@ if (in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get_
                 'dropoff' => array(
                     'address' => array(
                         'streetAddress' => $street_address,
-                        'telephone' => get_user_meta($order->get_customer_id(), 'billing_phone', true),
                         'contactName' => $contact_name,
                     ),
                     'timeSlot' => $shipping_date,
                     'comments' => $task_comments,
                 )
             );
+
+            $phone_number = get_user_meta($order->get_customer_id(), 'billing_phone', true);
+            if (!$phone_number) {
+                $phone_number = $order->get_billing_phone();
+            }
+
+            if ($phone_number) {
+                $data['dropoff']['address']['telephone'] = $phone_number;
+            }
 
             $http_client = CoopCycle::http_client();
 
