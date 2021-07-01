@@ -22,7 +22,7 @@ class Coopcycle extends CarrierModule
     {
         $this->name = 'coopcycle';
         $this->tab = 'shipping_logistics';
-        $this->version = '0.1.3';
+        $this->version = '0.3.3';
         $this->author = 'CoopCycle Team';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = array('min' => '1.6', 'max' => _PS_VERSION_);
@@ -234,7 +234,7 @@ class Coopcycle extends CarrierModule
 
         $httpCode = !curl_errno($ch) ? curl_getinfo($ch, CURLINFO_HTTP_CODE) : null;
 
-        if ($httpCode !== 200) {
+        if (!in_array($httpCode, [200, 201, 204])) {
             curl_close($ch);
 
             return false;
@@ -585,7 +585,9 @@ class Coopcycle extends CarrierModule
      */
     public function hookActionValidateOrder($params)
     {
-        $this->createDeliveryFromOrder($params['order']);
+        if ((int) $params['orderStatus']->id === (int) Configuration::get('PS_OS_PAYMENT')) {
+            $this->createDeliveryFromOrder($params['order']);
+        }
     }
 
     /**
@@ -613,6 +615,14 @@ class Coopcycle extends CarrierModule
             'CoopCycle::createDeliveryFromOrder',
             1, null, 'Order', (int) $order->id, true);
 
+        // Make sure we don't create the delivery twice
+        if (CoopCycleOrderTracking::existsFor($order)) {
+            PrestaShopLogger::addLog(
+                'CoopCycle::createDeliveryFromOrder - delivery already exists, skipping',
+                1, null, 'Order', (int) $order->id, true);
+            return;
+        }
+
         if ((int) $order->id_carrier !== (int) Configuration::get(self::CONFIG_PREFIX . 'CARRIER_ID')) {
             PrestaShopLogger::addLog(
                 'CoopCycle::createDeliveryFromOrder - carrier does not match',
@@ -635,18 +645,12 @@ class Coopcycle extends CarrierModule
 
         $address = new Address((int) $order->id_address_delivery, $this->context->language->id);
 
-        $street_address = implode(' ', array(
-            $address->address1,
-            $address->postcode,
-            $address->city,
-        ));
-
         $payload = array(
             'dropoff' => array(
                 'address' => array(
-                    'streetAddress' => $street_address,
-                    'description' => $address->other,
-                    'contactName' => trim(implode(' ', array($address->firstname, $address->lastname))),
+                    'streetAddress' => $this->stringifyAddress($address),
+                    'description'   => $address->other,
+                    'contactName'   => trim(implode(' ', array($address->firstname, $address->lastname))),
                 ),
                 'timeSlot' => $cart_time_slot->time_slot,
             )
@@ -655,6 +659,20 @@ class Coopcycle extends CarrierModule
         if ($address->phone || $address->phone_mobile) {
             $payload['dropoff']['address']['telephone'] = $address->phone ? $address->phone : $address->phone_mobile;
         }
+
+        $shop = new Shop((int) $order->id_shop);
+
+        if (!Validate::isLoadedObject($shop)) {
+            PrestaShopLogger::addLog(
+                sprintf('CoopCycle::createDeliveryFromOrder - shop with id %d could not be loaded', $order->id_shop),
+                1, null, 'Order', (int) $order->id, true);
+            return;
+        }
+
+        $payload = $this->addPickupAddress($order, $shop, $payload);
+
+        // We send the order summary as text in comments
+        $payload['pickup']['comments'] = $this->stringifyOrder($order);
 
         $delivery = $this->httpRequest('POST', '/api/deliveries', array(
             'body_json' => $payload,
@@ -665,9 +683,91 @@ class Coopcycle extends CarrierModule
             ),
         ));
 
+        if (false === $delivery) {
+            PrestaShopLogger::addLog(
+                'CoopCycle::createDeliveryFromOrder - error, could not create delivery',
+                5, null, 'Order', (int) $order->id, true);
+
+            return;
+        }
+
         $order_tracking = new CoopCycleOrderTracking($order->id);
         $order_tracking->delivery = $delivery['@id'];
 
         $order_tracking->save();
+
+        PrestaShopLogger::addLog(
+            'CoopCycle::createDeliveryFromOrder - success',
+            1, null, 'Order', (int) $order->id, true);
+    }
+
+    private function stringifyAddress(Address $address)
+    {
+        $parts = [];
+
+        if (!empty($address->address1)) {
+            $parts[] = $address->address1;
+        }
+
+        if (!empty($address->city)) {
+            $parts[] = trim($address->postcode . ' ' . $address->city);
+        }
+
+        if (count($parts) === 0) {
+
+            return '';
+        }
+
+        return implode(', ', $parts);
+    }
+
+    private function stringifyOrder(Order $order)
+    {
+        $text = '';
+
+        $shop = new Shop((int) $order->id_shop);
+
+        if (Validate::isLoadedObject($shop)) {
+            $text .= sprintf("%s\n\n", $shop->name);
+        }
+
+        foreach ($order->getProducts() as $product) {
+            $text .= sprintf("%d × %s\n", (int) $product['product_quantity'], $product['product_name']);
+        }
+
+        return $text;
+    }
+
+    /**
+     * @param Order $order
+     * @param array $payload
+     *
+     * @return array
+     */
+    private function addPickupAddress(Order $order, Shop $shop, array $payload)
+    {
+        $pickupAddress = array();
+
+        // We use the shop address as pickup address
+        $addressAsText = $this->stringifyAddress($shop->getAddress());
+        if (!empty($addressAsText)) {
+            $pickupAddress['streetAddress'] = $addressAsText;
+        }
+
+        $telephone = Configuration::get('PS_SHOP_PHONE');
+        if ($telephone) {
+            $pickupAddress['telephone'] = $telephone;
+        }
+
+        if (!empty($pickupAddress)) {
+
+            return array_merge($payload, array(
+                'pickup' => array(
+                    'address' => $pickupAddress,
+                )
+            ));
+        }
+
+        return $payload;
     }
 }
